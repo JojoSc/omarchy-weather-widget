@@ -23,7 +23,7 @@ Item {
   property string script: "~/.config/omarchy/bar/scripts/weather.sh"
   property string label: ""
   property string tip: ""
-  // The script's `popup` payload (city, desc, temp, hourly[], daily[]), or
+  // The script's `popup` payload (city, desc, temp, uv, hourly[], daily[]), or
   // null when it had nothing to forecast — then hover falls back to the
   // tooltip.
   property var forecast: null

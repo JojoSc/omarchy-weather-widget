@@ -8,9 +8,13 @@ import Quickshell.Hyprland
 // module's calendar: a frosted card hanging 6px under the centre island, a
 // header with the place on the left and the current conditions on the
 // right, a 7×22px grid of the coming hours (hour, glyph, temperature) over
-// a temperature curve and chance-of-rain bars for those hours, a hairline,
-// then one row per day, today first, with glyph, name, low, a temperature
-// range bar and high.
+// a temperature curve and chance-of-rain bars for those hours, a line with
+// the UV index and today's wind, a hairline, then one row per day, today
+// first, with glyph, name, low, a temperature range bar and high.
+// The hours scroll: seven show at a time out of up to 24, the wheel moves
+// them, and a dim ‹ or › beside the hour row says there is more that way.
+// Night hours stand on a faint shade, and a thin line marks midnight.
+// The rain graph is left out of a dry forecast.
 // The bars follow the iOS Weather app: one track shared by every day (the
 // week's coldest low at its left end, its warmest high at the right), each
 // day's pill covering its own low..high stretch of that scale, coloured by
@@ -32,9 +36,9 @@ PanelWindow {
   property Item anchorItem: null
   property bool open: false
   property bool pinned: false
-  // The weather script's `popup` payload: city, desc, temp, hourly[] (with
-  // `p`, the chance of rain in %), daily[] (today first, flagged `today`;
-  // weekend days flagged `we`).
+  // The weather script's `popup` payload: city, desc, temp, uv{now, max},
+  // wind{min, max} (today's, km/h), hourly[] (with `p`, the chance of rain
+  // in %), daily[] (today first, flagged `today`; weekend days flagged `we`).
   property var report: null
   // Bar position "top" only; a bottom bar would need the anchors flipped.
   property int gap: 6
@@ -58,6 +62,8 @@ PanelWindow {
 
   readonly property var hourly: report && report.hourly ? report.hourly : []
   readonly property var daily: report && report.daily ? report.daily : []
+  readonly property var uv: report && report.uv && typeof report.uv.now === "number" && typeof report.uv.max === "number" ? report.uv : null
+  readonly property var wind: report && report.wind && typeof report.wind.min === "number" && typeof report.wind.max === "number" ? report.wind : null
   readonly property string city: report && report.city ? String(report.city) : ""
   readonly property string conditions: {
     if (!report) return ""
@@ -143,21 +149,107 @@ PanelWindow {
   readonly property int cellW: 22
   readonly property int cellH: 20
   readonly property int cellGap: 2
-  readonly property int columns: Math.max(1, hourly.length)
-  readonly property int gridMinW: cellW * 7 + cellGap * 6
+  // The hour grid shows `hourColumns` hours at a time; the rest of the
+  // report scrolls in, `hourOffset` columns from the start.
+  readonly property int hourColumns: 7
+  readonly property int columns: Math.max(1, Math.min(hourColumns, hourly.length))
+  // A column is never narrower than its widest label plus some air: a
+  // "100%" or a "-10°" outgrows the 22px.
+  readonly property int hourCellW: {
+    var w = cellW
+    for (var i = 0; i < hourly.length; i++) {
+      w = Math.max(w, dayMetrics.advanceWidth(hourly[i].t + "°") + 4)
+      if ((hourly[i].p || 0) >= 10) w = Math.max(w, dayMetrics.advanceWidth(hourly[i].p + "%") + 4)
+    }
+    return Math.ceil(w)
+  }
+  readonly property int gridMinW: hourCellW * hourColumns + cellGap * (hourColumns - 1)
   // A long place name can outgrow seven columns; the grid then stretches to
   // the header rather than eliding the city.
-  readonly property int gridW: Math.max(gridMinW, Math.ceil(header.implicitWidth), dailyMinW)
+  readonly property int gridW: Math.max(gridMinW, Math.ceil(header.implicitWidth), dailyMinW, statsMinW)
   readonly property real columnW: (gridW - cellGap * (columns - 1)) / columns
+  readonly property real columnStep: columnW + cellGap
+  readonly property real stripW: Math.max(gridW, hourly.length * columnStep - cellGap)
+  readonly property int maxHourOffset: Math.max(0, hourly.length - columns)
+  property int hourOffset: 0
+  // Set while the offset is put back for a fresh open, so the strip jumps
+  // there instead of sliding.
+  property bool hourJump: false
+  onMaxHourOffsetChanged: stepHours(0)
   readonly property int dayRowH: 18
+  // The line of today's figures needs its two groups side by side with
+  // some air between them.
+  readonly property int statsMinW: Math.ceil(uvStat.implicitWidth + windStat.implicitWidth + (uv && wind ? 12 : 0))
   // The two hourly graphs under the hour grid: the temperature curve and
-  // the chance-of-rain bars, each with a few px of air above its plot.
+  // the chance-of-rain bars, each with a few px of air above its plot. The
+  // rain graph only exists when some hour has a chance of rain; its
+  // percentages need 10%.
   readonly property int tempGraphH: 34
   readonly property int rainGraphH: 22
   readonly property int graphInset: 4
+  readonly property bool hasRain: hourly.some(function(h) { return (h.p || 0) > 0 })
   readonly property bool anyRain: hourly.some(function(h) { return (h.p || 0) >= 10 })
 
-  function columnCenter(i) { return i * (columnW + cellGap) + columnW / 2 }
+  // The temperature graph's range: that of all the hours, so the curve
+  // keeps its shape while they scroll, widened to at least 4° so a flat run
+  // stays flat.
+  readonly property var tempAxis: {
+    if (hourly.length === 0) return null
+    var lo = Infinity, hi = -Infinity
+    for (var i = 0; i < hourly.length; i++) {
+      lo = Math.min(lo, hourly[i].t)
+      hi = Math.max(hi, hourly[i].t)
+    }
+    for (var up = true; hi - lo < 4; up = !up) {
+      if (up) hi++
+      else lo--
+    }
+    return { lo: lo, hi: hi }
+  }
+
+  function columnCenter(i) { return i * columnStep + columnW / 2 }
+
+  // Behind the hours: the runs of consecutive night hours (first and last
+  // column of each), which get a shade, and the column the date changes
+  // before (-1 when it does not within the report, or only at its start),
+  // which gets a line. The shade is black whatever the theme, so night
+  // reads darker on a dark card too; it takes more of it to show there.
+  readonly property var nightRuns: {
+    var runs = [], from = -1
+    for (var i = 0; i < hourly.length; i++) {
+      if (hourly[i].n) {
+        if (from < 0) from = i
+      } else if (from >= 0) {
+        runs.push({ from: from, to: i - 1 })
+        from = -1
+      }
+    }
+    if (from >= 0) runs.push({ from: from, to: hourly.length - 1 })
+    return runs
+  }
+  readonly property int midnightColumn: {
+    for (var i = 1; i < hourly.length; i++)
+      if (Number(hourly[i].h) < Number(hourly[i - 1].h)) return i
+    return -1
+  }
+  readonly property color nightShade: Qt.rgba(0, 0, 0, paper.hslLightness < 0.5 ? 0.22 : 0.06)
+  readonly property int nightRadius: 5
+
+  function stepHours(n) {
+    hourOffset = Math.max(0, Math.min(maxHourOffset, hourOffset + n))
+  }
+
+  // Wheel or touchpad: half a wheel notch (60 units of angle delta) moves
+  // the hours one column, down or right towards later.
+  property real wheelRest: 0
+
+  function scrollHours(delta) {
+    wheelRest -= delta
+    var steps = wheelRest > 0 ? Math.floor(wheelRest / 60) : Math.ceil(wheelRest / 60)
+    if (steps === 0) return
+    wheelRest -= steps * 60
+    stepHours(steps)
+  }
 
   // A Catmull-Rom spline through the points, as cubic Béziers.
   function curveThrough(ctx, xs, ys) {
@@ -288,7 +380,15 @@ PanelWindow {
     cardY = Math.round(pillBottom + gap)
   }
 
-  onOpenChanged: if (open) place()
+  // Every open starts at the next hour again.
+  onOpenChanged: {
+    if (!open) return
+    hourJump = true
+    hourOffset = 0
+    hourJump = false
+    wheelRest = 0
+    place()
+  }
   // A refreshed report can change the header, and with it the card width.
   onCardWChanged: if (open) place()
 
@@ -379,6 +479,17 @@ PanelWindow {
 
     HoverHandler { id: cardHover }
 
+    // The wheel anywhere on the card scrolls the hours. A touchpad reports
+    // both axes at once; the one that leads counts.
+    MouseArea {
+      anchors.fill: parent
+      acceptedButtons: Qt.NoButton
+      onWheel: function(wheel) {
+        var dx = wheel.angleDelta.x, dy = wheel.angleDelta.y
+        root.scrollHours(Math.abs(dx) > Math.abs(dy) ? dx : dy)
+      }
+    }
+
     Column {
       id: column
       x: root.padSide
@@ -422,111 +533,212 @@ PanelWindow {
       }
 
       // ---- The coming hours: hour, glyph and temperature share one column
-      //      grid, so each hour reads straight down.
-      Column {
-        spacing: root.cellGap
+      //      grid, so each hour reads straight down. The whole strip (rows
+      //      and graphs) slides behind a window of `hourColumns` columns;
+      //      the chevrons beside it stay put.
+      Item {
+        id: hours
+        width: root.gridW
+        height: hourStrip.height
 
-        HourRow { kind: "hour" }
-        HourRow { kind: "glyph" }
-        HourRow { kind: "temp" }
+        Item {
+          anchors.fill: parent
+          clip: true
 
-        // ---- The temperature through the hours: a curve through each
-        //      column's centre, stroked and (faintly) filled with the
-        //      temperature scale's colour at each hour. It runs flat out to
-        //      the grid's edges so it covers the same width as the hour
-        //      columns and the rain bars under it. The plot spans the hours'
-        //      own range, at least 4° so a flat run stays flat.
-        Canvas {
-          width: root.gridW
-          height: root.tempGraphH
-          antialiasing: true
+          // Under the strip and sliding with it: the night shade, between
+          // columns at each end and rounded there like the weekend band —
+          // except where the night runs on past the report, where it is
+          // pushed out of the strip — and the midnight line.
+          Item {
+            x: hourStrip.x
+            height: parent.height
 
-          readonly property var paintKey: [root.hourly, root.ink, width, height]
-          onPaintKeyChanged: requestPaint()
+            Repeater {
+              model: root.nightRuns
 
-          onPaint: {
-            var ctx = getContext("2d")
-            ctx.clearRect(0, 0, width, height)
-            var pts = root.hourly, n = pts.length
-            if (n === 0) return
-            var top = root.graphInset + 1, bottom = height - 2
-            var tMin = Infinity, tMax = -Infinity
-            for (var i = 0; i < n; i++) { tMin = Math.min(tMin, pts[i].t); tMax = Math.max(tMax, pts[i].t) }
-            var span = Math.max(4, tMax - tMin), mid = (tMin + tMax) / 2
-            var xs = [0], ys = []
-            for (i = 0; i < n; i++) {
-              xs.push(root.columnCenter(i))
-              ys.push((top + bottom) / 2 - (pts[i].t - mid) / span * (bottom - top))
-            }
-            ys.unshift(ys[0])
-            xs.push(width)
-            ys.push(ys[ys.length - 1])
-
-            var line = ctx.createLinearGradient(0, 0, width, 0)
-            var fill = ctx.createLinearGradient(0, 0, width, 0)
-            for (i = 0; i < n; i++) {
-              var c = root.tempColor(pts[i].t)
-              line.addColorStop(xs[i + 1] / width, root.css(c))
-              fill.addColorStop(xs[i + 1] / width, root.css(Qt.alpha(c, 0.18)))
+              Rectangle {
+                required property var modelData
+                readonly property real from: modelData.from === 0
+                  ? -root.nightRadius : modelData.from * root.columnStep - root.cellGap / 2
+                readonly property real to: modelData.to === root.hourly.length - 1
+                  ? root.stripW + root.nightRadius : (modelData.to + 1) * root.columnStep - root.cellGap / 2
+                x: from
+                width: to - from
+                height: parent.height
+                radius: root.nightRadius
+                color: root.nightShade
+              }
             }
 
-            ctx.beginPath()
-            root.curveThrough(ctx, xs, ys)
-            ctx.lineTo(width, bottom)
-            ctx.lineTo(0, bottom)
-            ctx.closePath()
-            ctx.fillStyle = fill
-            ctx.fill()
+            Rectangle {
+              visible: root.midnightColumn > 0
+              x: root.midnightColumn * root.columnStep - root.cellGap / 2 - 0.5
+              width: 1
+              height: parent.height
+              color: root.ink
+              opacity: 0.22
+            }
+          }
 
-            ctx.beginPath()
-            root.curveThrough(ctx, xs, ys)
-            ctx.strokeStyle = line
-            ctx.lineWidth = 2
-            ctx.lineCap = "butt"
-            ctx.lineJoin = "round"
-            ctx.stroke()
+          Column {
+            id: hourStrip
+            x: -root.hourOffset * root.columnStep
+            spacing: root.cellGap
+
+            Behavior on x {
+              enabled: !root.hourJump
+              NumberAnimation { duration: 180; easing.type: Easing.OutCubic }
+            }
+
+            HourRow { kind: "hour" }
+            HourRow { kind: "glyph" }
+            HourRow { id: tempRow; kind: "temp" }
+
+            // ---- The temperature through the hours: a curve through each
+            //      column's centre, stroked and (faintly) filled with the
+            //      temperature scale's colour at each hour. It runs flat out
+            //      to the strip's ends so it covers the same width as the
+            //      hour columns and the rain bars under it. The plot spans
+            //      `tempAxis`.
+            Canvas {
+              id: tempGraph
+              width: root.stripW
+              height: root.tempGraphH
+              antialiasing: true
+
+              readonly property var paintKey: [root.hourly, root.ink, width, height]
+              onPaintKeyChanged: requestPaint()
+
+              onPaint: {
+                var ctx = getContext("2d")
+                ctx.clearRect(0, 0, width, height)
+                var pts = root.hourly, n = pts.length, axis = root.tempAxis
+                if (n === 0 || !axis) return
+                var top = root.graphInset + 1, bottom = height - 2
+                var xs = [0], ys = []
+                for (var i = 0; i < n; i++) {
+                  xs.push(root.columnCenter(i))
+                  ys.push(bottom - (pts[i].t - axis.lo) / (axis.hi - axis.lo) * (bottom - top))
+                }
+                ys.unshift(ys[0])
+                xs.push(width)
+                ys.push(ys[ys.length - 1])
+
+                var line = ctx.createLinearGradient(0, 0, width, 0)
+                var fill = ctx.createLinearGradient(0, 0, width, 0)
+                for (i = 0; i < n; i++) {
+                  var c = root.tempColor(pts[i].t)
+                  line.addColorStop(xs[i + 1] / width, root.css(c))
+                  fill.addColorStop(xs[i + 1] / width, root.css(Qt.alpha(c, 0.18)))
+                }
+
+                ctx.beginPath()
+                root.curveThrough(ctx, xs, ys)
+                ctx.lineTo(width, bottom)
+                ctx.lineTo(0, bottom)
+                ctx.closePath()
+                ctx.fillStyle = fill
+                ctx.fill()
+
+                ctx.beginPath()
+                root.curveThrough(ctx, xs, ys)
+                ctx.strokeStyle = line
+                ctx.lineWidth = 2
+                ctx.lineCap = "butt"
+                ctx.lineJoin = "round"
+                ctx.stroke()
+              }
+            }
+
+            // ---- Chance of rain: a blue bar per hour on a hairline
+            //      baseline, full height at 100%, rounded at the top; the
+            //      percentages under it, only shown from 10%. A forecast
+            //      without any chance of rain has neither.
+            Canvas {
+              id: rainGraph
+              visible: root.hasRain
+              width: root.stripW
+              height: root.rainGraphH
+              antialiasing: true
+
+              readonly property var paintKey: [root.hourly, root.ink, width, height, visible]
+              onPaintKeyChanged: requestPaint()
+
+              onPaint: {
+                var ctx = getContext("2d")
+                ctx.clearRect(0, 0, width, height)
+                var pts = root.hourly, n = pts.length
+                var top = root.graphInset, base = height - 1
+                ctx.fillStyle = root.css(Qt.alpha(root.ink, 0.12))
+                ctx.fillRect(0, base, width, 1)
+                ctx.fillStyle = root.css(Qt.alpha(root.blue, 0.85))
+                var bw = Math.max(4, Math.round(root.columnW) - 8), r = 2
+                for (var i = 0; i < n; i++) {
+                  var p = Math.max(0, Math.min(100, pts[i].p || 0))
+                  if (p <= 0) continue
+                  var bh = Math.max(2, (base - top) * p / 100)
+                  var x = Math.round(root.columnCenter(i) - bw / 2), y = base - bh
+                  ctx.beginPath()
+                  ctx.moveTo(x, base)
+                  ctx.lineTo(x, y + r)
+                  ctx.quadraticCurveTo(x, y, x + r, y)
+                  ctx.lineTo(x + bw - r, y)
+                  ctx.quadraticCurveTo(x + bw, y, x + bw, y + r)
+                  ctx.lineTo(x + bw, base)
+                  ctx.closePath()
+                  ctx.fill()
+                }
+              }
+            }
+
+            HourRow { kind: "rain"; visible: root.anyRain }
           }
         }
 
-        // ---- Chance of rain: a blue bar per hour on a hairline baseline,
-        //      full height at 100%, rounded at the top; the percentages
-        //      under it, only shown from 10% so a dry day reads empty.
-        Canvas {
-          width: root.gridW
-          height: root.rainGraphH
-          antialiasing: true
-
-          readonly property var paintKey: [root.hourly, root.ink, width, height]
-          onPaintKeyChanged: requestPaint()
-
-          onPaint: {
-            var ctx = getContext("2d")
-            ctx.clearRect(0, 0, width, height)
-            var pts = root.hourly, n = pts.length
-            var top = root.graphInset, base = height - 1
-            ctx.fillStyle = root.css(Qt.alpha(root.ink, 0.12))
-            ctx.fillRect(0, base, width, 1)
-            ctx.fillStyle = root.css(Qt.alpha(root.blue, 0.85))
-            var bw = Math.max(4, Math.round(root.columnW) - 8), r = 2
-            for (var i = 0; i < n; i++) {
-              var p = Math.max(0, Math.min(100, pts[i].p || 0))
-              if (p <= 0) continue
-              var bh = Math.max(2, (base - top) * p / 100)
-              var x = Math.round(root.columnCenter(i) - bw / 2), y = base - bh
-              ctx.beginPath()
-              ctx.moveTo(x, base)
-              ctx.lineTo(x, y + r)
-              ctx.quadraticCurveTo(x, y, x + r, y)
-              ctx.lineTo(x + bw - r, y)
-              ctx.quadraticCurveTo(x + bw, y, x + bw, y + r)
-              ctx.lineTo(x + bw, base)
-              ctx.closePath()
-              ctx.fill()
-            }
-          }
+        // ---- More hours that way: a dim chevron beside the hour row, in
+        //      the card's padding on the side that still has some. A click
+        //      pages that way.
+        HourChevron {
+          x: -(root.padSide + width) / 2
+          text: "‹"
+          shown: root.hourOffset > 0
+          onClicked: root.stepHours(1 - root.columns)
         }
 
-        HourRow { kind: "rain"; visible: root.anyRain }
+        HourChevron {
+          x: parent.width + (root.padSide - width) / 2
+          text: "›"
+          shown: root.hourOffset < root.maxHourOffset
+          onClicked: root.stepHours(root.columns - 1)
+        }
+      }
+
+      // ---- Today's figures on one line: left the UV index, now and the
+      //      most it reaches; right the wind, from its calmest hour to its
+      //      strongest. Names and numbers in ink, the words between dimmed.
+      Item {
+        visible: root.uv !== null || root.wind !== null
+        width: root.gridW
+        height: root.dayRowH
+
+        Stat {
+          id: uvStat
+          x: 0
+          parts: root.uv ? [
+            { text: "UV " + Math.round(root.uv.now), dim: false },
+            { text: " · max ", dim: true },
+            { text: String(Math.round(root.uv.max)), dim: false }
+          ] : []
+        }
+
+        Stat {
+          id: windStat
+          x: parent.width - width
+          parts: root.wind ? [
+            { text: "Wind " + (root.wind.min === root.wind.max ? root.wind.max : root.wind.min + "–" + root.wind.max), dim: false },
+            { text: " km/h", dim: true }
+          ] : []
+        }
       }
 
       Rectangle {
@@ -771,6 +983,60 @@ PanelWindow {
           renderType: Text.NativeRendering
         }
       }
+    }
+  }
+
+  // A run of text on the line of today's figures: `parts` are its pieces
+  // in order, each `{ text, dim }`.
+  component Stat: Row {
+    property var parts: []
+
+    y: (parent.height - height) / 2 + root.capShift
+
+    Repeater {
+      model: parent.parts
+
+      Text {
+        required property var modelData
+        text: modelData.text
+        textFormat: Text.PlainText
+        color: root.ink
+        opacity: modelData.dim ? 0.4 : 1.0
+        font.family: root.fontFamily
+        font.pixelSize: root.fontSize
+        renderType: Text.NativeRendering
+      }
+    }
+  }
+
+  // A chevron beside the hour row, faded out while there is nothing more
+  // on its side.
+  component HourChevron: Text {
+    id: hourChevron
+
+    property bool shown: false
+    signal clicked()
+
+    y: (root.cellH - height) / 2
+    textFormat: Text.PlainText
+    color: root.ink
+    opacity: !shown ? 0 : chevronMouse.containsMouse ? 0.9 : 0.4
+    font.family: root.fontFamily
+    font.pixelSize: root.fontSize
+    renderType: Text.NativeRendering
+
+    Behavior on opacity {
+      NumberAnimation { duration: 120 }
+    }
+
+    MouseArea {
+      id: chevronMouse
+      anchors.fill: parent
+      anchors.margins: -4
+      enabled: hourChevron.shown
+      hoverEnabled: true
+      cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+      onClicked: hourChevron.clicked()
     }
   }
 
