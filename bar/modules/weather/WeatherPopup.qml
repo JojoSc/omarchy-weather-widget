@@ -50,7 +50,10 @@ PanelWindow {
   readonly property var anchorWindow: anchorItem ? anchorItem.QsWindow.window : null
 
   readonly property color ink: bar ? bar.barForeground : "#1c1b1f"
-  readonly property color paper: bar && bar.islandBase !== undefined ? bar.islandBase : "#ffffff"
+  // A bar without island colours (the stock one) gets a plain card: white
+  // under dark text, near black under light text.
+  readonly property color paper: bar && bar.islandBase !== undefined ? bar.islandBase
+    : ink.hslLightness > 0.5 ? "#1c1b1f" : "#ffffff"
   readonly property color hairline: bar && bar.islandBorder !== undefined ? bar.islandBorder : Qt.alpha(ink, 0.16)
   readonly property string fontFamily: bar ? bar.fontFamily : "monospace"
   readonly property int fontSize: bar && bar.barFontSize ? bar.barFontSize : 11
@@ -172,9 +175,10 @@ PanelWindow {
   readonly property real stripW: Math.max(gridW, hourly.length * columnStep - cellGap)
   readonly property int maxHourOffset: Math.max(0, hourly.length - columns)
   property int hourOffset: 0
-  // Set while the offset is put back for a fresh open, so the strip jumps
-  // there instead of sliding.
-  property bool hourJump: false
+  // Set while a scroll or a chevron moves the offset, so the strip slides
+  // there. Any other change of its place (a fresh open, a refreshed report
+  // resizing the columns or clamping the offset) is a jump.
+  property bool hourSlide: false
   onMaxHourOffsetChanged: stepHours(0)
   readonly property int dayRowH: 18
   // The line of today's figures needs its two groups side by side with
@@ -200,9 +204,10 @@ PanelWindow {
       lo = Math.min(lo, hourly[i].t)
       hi = Math.max(hi, hourly[i].t)
     }
-    for (var up = true; hi - lo < 4; up = !up) {
-      if (up) hi++
-      else lo--
+    var short = 4 - (hi - lo)
+    if (short > 0) {
+      hi += Math.ceil(short / 2)
+      lo -= Math.floor(short / 2)
     }
     return { lo: lo, hi: hi }
   }
@@ -239,16 +244,23 @@ PanelWindow {
     hourOffset = Math.max(0, Math.min(maxHourOffset, hourOffset + n))
   }
 
-  // Wheel or touchpad: half a wheel notch (60 units of angle delta) moves
-  // the hours one column, down or right towards later.
+  function slideHours(n) {
+    hourSlide = true
+    stepHours(n)
+    hourSlide = false
+  }
+
+  // Wheel or touchpad, down or right towards later; `perColumn` is how much
+  // delta moves the hours one column, and `wheelRest` the part of a column
+  // not moved yet.
   property real wheelRest: 0
 
-  function scrollHours(delta) {
-    wheelRest -= delta
-    var steps = wheelRest > 0 ? Math.floor(wheelRest / 60) : Math.ceil(wheelRest / 60)
+  function scrollHours(delta, perColumn) {
+    wheelRest -= delta / perColumn
+    var steps = wheelRest > 0 ? Math.floor(wheelRest) : Math.ceil(wheelRest)
     if (steps === 0) return
-    wheelRest -= steps * 60
-    stepHours(steps)
+    wheelRest -= steps
+    slideHours(steps)
   }
 
   // A Catmull-Rom spline through the points, as cubic Béziers.
@@ -286,7 +298,9 @@ PanelWindow {
   //      under the last row. Nothing is drawn when no 10° mark falls inside.
   readonly property var ticks: {
     var out = []
-    if (daily.length === 0) return out
+    // No marks for a span no weather has: a corrupt report must not have
+    // this loop run for ever.
+    if (daily.length === 0 || !(weekHi - weekLo <= 200)) return out
     for (var t = Math.ceil(weekLo / 10) * 10; t <= weekHi; t += 10) out.push(t)
     return out
   }
@@ -383,9 +397,7 @@ PanelWindow {
   // Every open starts at the next hour again.
   onOpenChanged: {
     if (!open) return
-    hourJump = true
     hourOffset = 0
-    hourJump = false
     wheelRest = 0
     place()
   }
@@ -480,13 +492,17 @@ PanelWindow {
     HoverHandler { id: cardHover }
 
     // The wheel anywhere on the card scrolls the hours. A touchpad reports
-    // both axes at once; the one that leads counts.
+    // how far the fingers moved, in pixels, and the hours follow them 1:1;
+    // a wheel only reports an angle, and half a notch (60 units) moves one
+    // column. A touchpad also reports both axes at once; the one that leads
+    // counts.
     MouseArea {
       anchors.fill: parent
       acceptedButtons: Qt.NoButton
       onWheel: function(wheel) {
-        var dx = wheel.angleDelta.x, dy = wheel.angleDelta.y
-        root.scrollHours(Math.abs(dx) > Math.abs(dy) ? dx : dy)
+        var fine = wheel.pixelDelta.x !== 0 || wheel.pixelDelta.y !== 0
+        var d = fine ? wheel.pixelDelta : wheel.angleDelta
+        root.scrollHours(Math.abs(d.x) > Math.abs(d.y) ? d.x : d.y, fine ? root.columnStep : 60)
       }
     }
 
@@ -534,8 +550,7 @@ PanelWindow {
 
       // ---- The coming hours: hour, glyph and temperature share one column
       //      grid, so each hour reads straight down. The whole strip (rows
-      //      and graphs) slides behind a window of `hourColumns` columns;
-      //      the chevrons beside it stay put.
+      //      and graphs) slides behind a window of `hourColumns` columns.
       Item {
         id: hours
         width: root.gridW
@@ -586,7 +601,7 @@ PanelWindow {
             spacing: root.cellGap
 
             Behavior on x {
-              enabled: !root.hourJump
+              enabled: root.hourSlide
               NumberAnimation { duration: 180; easing.type: Easing.OutCubic }
             }
 
@@ -613,7 +628,7 @@ PanelWindow {
                 var ctx = getContext("2d")
                 ctx.clearRect(0, 0, width, height)
                 var pts = root.hourly, n = pts.length, axis = root.tempAxis
-                if (n === 0 || !axis) return
+                if (n === 0 || !axis || !(axis.hi > axis.lo)) return
                 var top = root.graphInset + 1, bottom = height - 2
                 var xs = [0], ys = []
                 for (var i = 0; i < n; i++) {
@@ -694,23 +709,6 @@ PanelWindow {
             HourRow { kind: "rain"; visible: root.anyRain }
           }
         }
-
-        // ---- More hours that way: a dim chevron beside the hour row, in
-        //      the card's padding on the side that still has some. A click
-        //      pages that way.
-        HourChevron {
-          x: -(root.padSide + width) / 2
-          text: "‹"
-          shown: root.hourOffset > 0
-          onClicked: root.stepHours(1 - root.columns)
-        }
-
-        HourChevron {
-          x: parent.width + (root.padSide - width) / 2
-          text: "›"
-          shown: root.hourOffset < root.maxHourOffset
-          onClicked: root.stepHours(root.columns - 1)
-        }
       }
 
       // ---- Today's figures on one line: left the UV index, now and the
@@ -725,9 +723,9 @@ PanelWindow {
           id: uvStat
           x: 0
           parts: root.uv ? [
-            { text: "UV " + Math.round(root.uv.now), dim: false },
+            { text: "UV " + root.uv.now, dim: false },
             { text: " · max ", dim: true },
-            { text: String(Math.round(root.uv.max)), dim: false }
+            { text: String(root.uv.max), dim: false }
           ] : []
         }
 
@@ -935,6 +933,27 @@ PanelWindow {
       }
       }
     }
+
+    // ---- More hours that way: a dim chevron beside the hour row, in the
+    //      card's padding on the side that still has some. A click pages
+    //      that way. They are children of the card, not of the hour row:
+    //      the padding lies outside the column, and Qt hands no pointer
+    //      events to what sits outside its parent there.
+    HourChevron {
+      x: (root.padSide - width) / 2
+      y: column.y + hours.y + (root.cellH - height) / 2
+      text: "‹"
+      shown: root.hourOffset > 0
+      onClicked: root.slideHours(1 - root.columns)
+    }
+
+    HourChevron {
+      x: card.width - (root.padSide + width) / 2
+      y: column.y + hours.y + (root.cellH - height) / 2
+      text: "›"
+      shown: root.hourOffset < root.maxHourOffset
+      onClicked: root.slideHours(root.columns - 1)
+    }
   }
 
   // A condition glyph in the iOS icon colours (see glyphPaint): the glyph in
@@ -1010,29 +1029,36 @@ PanelWindow {
   }
 
   // A chevron beside the hour row, faded out while there is nothing more
-  // on its side.
-  component HourChevron: Text {
+  // on its side. The item is the click target: the glyph and 4px around it.
+  component HourChevron: Item {
     id: hourChevron
 
+    property string text
     property bool shown: false
     signal clicked()
 
-    y: (root.cellH - height) / 2
-    textFormat: Text.PlainText
-    color: root.ink
+    implicitWidth: chevronGlyph.implicitWidth + 8
+    implicitHeight: chevronGlyph.implicitHeight + 8
     opacity: !shown ? 0 : chevronMouse.containsMouse ? 0.9 : 0.4
-    font.family: root.fontFamily
-    font.pixelSize: root.fontSize
-    renderType: Text.NativeRendering
 
     Behavior on opacity {
       NumberAnimation { duration: 120 }
     }
 
+    Text {
+      id: chevronGlyph
+      anchors.centerIn: parent
+      text: hourChevron.text
+      textFormat: Text.PlainText
+      color: root.ink
+      font.family: root.fontFamily
+      font.pixelSize: root.fontSize
+      renderType: Text.NativeRendering
+    }
+
     MouseArea {
       id: chevronMouse
       anchors.fill: parent
-      anchors.margins: -4
       enabled: hourChevron.shown
       hoverEnabled: true
       cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor

@@ -10,9 +10,9 @@ import "weather"
 // The forecast is a hover read-out: it opens after a short dwell, stays while
 // the pointer is on the label or on the card, and goes away shortly after the
 // pointer leaves both. Left click pins it instead (the next outside click
-// dismisses it), right click forces a refresh by clearing the cache before
-// the next poll. The open/close/opened contract lets the bar's popout
-// coordinator close a pinned card when another panel opens.
+// dismisses it), right click fetches the weather afresh. The
+// open/close/opened contract lets the bar's popout coordinator close a
+// pinned card when another panel opens.
 Item {
   id: root
 
@@ -28,6 +28,8 @@ Item {
   // tooltip.
   property var forecast: null
   readonly property bool hasForecast: !!(forecast && forecast.hourly && forecast.hourly.length > 0)
+  // The bar shows a tooltip only for a target that reports itself hovered.
+  readonly property bool tooltipHovered: hover.hovered && !opened
 
   // The script speaks in Unicode weather symbols, which the bar font lacks;
   // a fallback font would render them, but its taller line box drops the
@@ -51,11 +53,13 @@ Item {
     return out.replace(/\ufe0f/g, "")
   }
 
-  // `keep` leaves the last good report up when a refresh comes back broken;
-  // the regular poll clears the label instead so a dead script is visible.
+  // `keep` leaves the last good report up when a refresh comes back broken
+  // or with nothing to show; the regular poll clears the label instead so a
+  // dead script is visible.
   function applyReport(raw, keep) {
     try {
       const j = JSON.parse(raw)
+      if (keep && !j.text) return
       root.label = root.toBarGlyphs(j.text)
       root.tip = j.tooltip || ""
       root.forecast = j.popup || null
@@ -80,13 +84,14 @@ Item {
     }
   }
 
-  // A forced refresh drops the caches in the same shell as the fetch, so the
-  // two stay ordered; a separate bar.run() could land after the fetch.
+  // A forced refresh has the script fetch again whatever the age of its
+  // caches. They are not deleted first: should the fetch fail, the script
+  // still has them to report from.
   function forceRefresh() { refetch.running = true }
 
   Process {
     id: refetch
-    command: ["bash", "-lc", "rm -f \"$HOME/.cache/omarchy-weather/\"*.json; " + root.script]
+    command: ["bash", "-lc", root.script + " --refresh"]
     stdout: StdioCollector {
       id: refreshCollector
       waitForEnd: true

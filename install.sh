@@ -5,8 +5,10 @@
 #   ./install.sh --section right add it to another section (left|center|right)
 #   ./install.sh --no-layout     copy files only, leave shell.json alone
 #
-# shell.json is backed up next to itself before it is changed. The Hyprland
-# blur rule (hypr/weather.lua) is not applied automatically; see the README.
+# shell.json is backed up next to itself before it is changed. Omarchy's own
+# weather pill is taken off the bar; `omarchy bar put omarchy.weather` brings
+# it back. The Hyprland blur rule (hypr/weather.lua) is not applied
+# automatically; see the README.
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -19,7 +21,7 @@ while (( $# > 0 )); do
   case "$1" in
     --section) SECTION="${2:?--section needs left, center or right}"; shift 2 ;;
     --no-layout) LAYOUT=0; shift ;;
-    -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,11p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 1 ;;
   esac
 done
@@ -46,6 +48,7 @@ if (( LAYOUT )); then
     echo "shell.json already has a \"weather\" module; layout left as is"
   else
     cp "$SHELL_JSON" "$SHELL_JSON.bak.$(date +%s)"
+    stock=$(jq '[.bar.layout[]?[]? | select((type == "object" and .id == "omarchy.weather") or . == "omarchy.weather")] | length' "$SHELL_JSON")
     # After the clock when it is in the chosen section, else at the end of it.
     # Omarchy's own omarchy.weather pill is dropped so the two do not sit side
     # by side; `omarchy bar put omarchy.weather` brings it back.
@@ -60,6 +63,9 @@ if (( LAYOUT )); then
           + .bar.layout[$s][$i:]
     ' "$SHELL_JSON" > "$SHELL_JSON.tmp" && mv "$SHELL_JSON.tmp" "$SHELL_JSON"
     echo "added the module to the $SECTION section of $SHELL_JSON"
+    if (( stock > 0 )); then
+      echo "took Omarchy's own weather pill off the bar; \`omarchy bar put omarchy.weather\` brings it back"
+    fi
   fi
 fi
 
@@ -67,5 +73,6 @@ cat <<MSG
 
 Next:
   - for the frosted card, append hypr/weather.lua to ~/.config/hypr/looknfeel.lua
+    (once; an update needs no second copy)
   - restart the shell:  omarchy restart shell
 MSG

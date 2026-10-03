@@ -9,7 +9,8 @@
 # the current conditions; the forecast comes from Open-Meteo (hourly steps,
 # a week ahead) at the coordinates wttr.in reports. wttr.in's own three-hourly,
 # three-day forecast fills in while Open-Meteo is unreachable. Both responses
-# are cached to keep requests rare.
+# are cached to keep requests rare; `--refresh` fetches them again whatever
+# their age. A fetch that fails leaves the cache as it was.
 
 LOCATION="${OMARCHY_WEATHER_LOCATION:-}"
 CACHE_DIR="$HOME/.cache/omarchy-weather"
@@ -19,12 +20,16 @@ MAX_AGE=900
 HOURS=24
 DAYS=5
 
+REFRESH=0
+[ "${1:-}" = "--refresh" ] && REFRESH=1
+
 mkdir -p "$CACHE_DIR"
 
-stale() { [ ! -s "$1" ] || [ "$(( $(date +%s) - $(stat -c %Y "$1") ))" -ge "$MAX_AGE" ]; }
+stale() { [ "$REFRESH" = 1 ] || [ ! -s "$1" ] || [ "$(( $(date +%s) - $(stat -c %Y "$1") ))" -ge "$MAX_AGE" ]; }
 
 if stale "$CACHE"; then
-  if curl -fsS --max-time 10 "https://wttr.in/${LOCATION}?format=j1" -o "$CACHE.tmp" \
+  # The place is part of the URL path, so it goes in percent-encoded.
+  if curl -fsS --max-time 10 "https://wttr.in/$(jq -rn --arg l "$LOCATION" '$l | @uri')?format=j1" -o "$CACHE.tmp" \
      && jq -e .current_condition "$CACHE.tmp" >/dev/null 2>&1; then
     mv "$CACHE.tmp" "$CACHE"
   else
@@ -53,7 +58,7 @@ else
 fi
 
 jq -c "${OM[@]}" --argjson hours "$HOURS" --argjson days "$DAYS" \
-   --arg today "$(date +%F)" --argjson now_h "$(date +%-H)" '
+   --argjson epoch "$(date +%s)" --arg today "$(date +%F)" --argjson now_h "$(date +%-H)" '
   # Condition keys shared with the module, which maps them to glyphs.
   def om_cond:                      # Open-Meteo WMO codes
     if . <= 1 then "clear"
@@ -81,23 +86,36 @@ jq -c "${OM[@]}" --argjson hours "$HOURS" --argjson days "$DAYS" \
   def clock_hour: capture("(?<h>\\d+):(?<m>\\d+) (?<p>AM|PM)") | ((.h | tonumber) % 12) + (if .p == "PM" then 12 else 0 end);
   def pad2: tostring | if length < 2 then "0" + . else . end;
   def num: if type == "number" then . elif type == "string" then (tonumber? // null) else null end;
-  def tenths: (. * 10 | round) / 10;
+  # An Open-Meteo local time ("2026-10-03T11:30") in seconds, read as UTC.
+  def om_seconds: try ((. + ":00Z") | fromdateiso8601) catch null;
 
   .current_condition[0] as $c
   | .nearest_area[0] as $a
-  | .weather[0] as $today_report
   | ($c.weatherCode | tonumber) as $code
-  | ($today_report.astronomy[0].sunrise | clock_hour) as $sunrise
-  | ($today_report.astronomy[0].sunset | clock_hour) as $sunset
-  | ($now_h < $sunrise or $now_h >= $sunset) as $night
   | $om[0] as $f
+
+  # Date and hour at the place, which need not be those of this machine:
+  # Open-Meteo reports the UTC offset there. Without a forecast the local
+  # date and hour stand in.
+  | (if ($f.utc_offset_seconds | type) == "number" then $epoch + $f.utc_offset_seconds else null end) as $local
+  | (if $local then $local | strftime("%Y-%m-%d") else $today end) as $today
+  | (if $local then $local | strftime("%H") | tonumber else $now_h end) as $now_h
+
+  # Either response may come from a cache that is hours or days old, so
+  # "today" and "now" are looked up in it by date, never taken by position.
+  | (.weather | map(.date) | index($today)) as $w
+  | (if $w == null then null else .weather[$w] end) as $today_report
+  | (($today_report // .weather[0]).astronomy[0]) as $sun
+  | ($sun.sunrise | clock_hour) as $sunrise
+  | ($sun.sunset | clock_hour) as $sunset
+  | ($now_h < $sunrise or $now_h >= $sunset) as $night
 
   # Open-Meteo: the hours after the current one (with the chance of rain, %),
   # then today and the days after it (today flagged, so the card can mark
-  # the current temperature; weekend days flagged too).
-  | (if $f and $f.hourly and $f.current then
-      (($f.current.time[0:13] + ":00") as $slot
-       | ($f.hourly.time | index($slot)) as $i
+  # the current temperature; weekend days flagged too). A forecast too old to
+  # hold the current hour or today leaves these empty for wttr.in to fill.
+  | (if $f and $f.hourly then
+      (($f.hourly.time | index($today + "T" + ($now_h | pad2) + ":00")) as $i
        | if $i == null then null else
            [range($i + 1; [$i + 1 + $hours, ($f.hourly.time | length)] | min)
             | { h: $f.hourly.time[.][11:13],
@@ -105,44 +123,46 @@ jq -c "${OM[@]}" --argjson hours "$HOURS" --argjson days "$DAYS" \
                 n: ($f.hourly.is_day[.] == 0),
                 t: ($f.hourly.temperature_2m[.] | round),
                 p: ($f.hourly.precipitation_probability[.] // 0) }]
+           | if length > 0 then . else null end
          end)
      else null end) as $om_hourly
-  | (if $f and $f.daily then
-      [range(0; [$days + 1, ($f.daily.time | length)] | min)
-       | { d: (if . == 0 then "Today" else ($f.daily.time[.] | dayname) end),
-           today: (. == 0),
+  | (if $f and $f.daily then ($f.daily.time | index($today)) else null end) as $d
+  | (if $d == null then null else
+      [range($d; [$d + $days + 1, ($f.daily.time | length)] | min)
+       | { d: (if . == $d then "Today" else ($f.daily.time[.] | dayname) end),
+           today: (. == $d),
            we: ($f.daily.time[.] | weekend),
            c: ($f.daily.weather_code[.] | om_cond),
            lo: ($f.daily.temperature_2m_min[.] | round),
            hi: ($f.daily.temperature_2m_max[.] | round) }]
-     else null end) as $om_daily
+     end) as $om_daily
 
   # wttr.in fallback: three-hourly slots after now (as many as cover the
   # same stretch of hours), then today and whatever days follow.
-  | ([.weather[0:2][] | .date as $d | .hourly[]
-      | { date: $d, h: ((.time | tonumber) / 100 | floor), code: (.weatherCode | tonumber), t: (.tempC | tonumber), p: (.chanceofrain | tonumber) }]
-     | map(select(.date > $today or .h > $now_h))
+  | ([.weather[] | .date as $date | .hourly[]
+      | { date: $date, h: ((.time | tonumber) / 100 | floor), code: (.weatherCode | tonumber), t: (.tempC | tonumber), p: (.chanceofrain | tonumber) }]
+     | map(select(.date > $today or (.date == $today and .h > $now_h)))
      | .[0:(($hours + 2) / 3 | floor)]
      | map({ h: (.h | pad2),
              c: (.code | wwo_cond),
              n: (.h < $sunrise or .h >= $sunset),
              t: .t,
              p: .p })) as $wttr_hourly
-  | ([.weather | to_entries[]
-      | { d: (if .key == 0 then "Today" else (.value.date | dayname) end),
-          today: (.key == 0),
-          we: (.value.date | weekend),
-          c: (.value.hourly[4].weatherCode | tonumber | wwo_cond),
-          lo: (.value.mintempC | tonumber),
-          hi: (.value.maxtempC | tonumber) }]) as $wttr_daily
-
-  # The Open-Meteo daily row for today: not simply the first, the cached
-  # forecast may be from yesterday.
-  | (if $f and $f.daily then ($f.daily.time | index($today)) else null end) as $d
+  | (if $w == null then null else
+      [.weather[$w:] | to_entries[]
+       | { d: (if .key == 0 then "Today" else (.value.date | dayname) end),
+           today: (.key == 0),
+           we: (.value.date | weekend),
+           c: (.value.hourly[4].weatherCode | tonumber | wwo_cond),
+           lo: (.value.mintempC | tonumber),
+           hi: (.value.maxtempC | tonumber) }]
+     end) as $wttr_daily
 
   # UV index: now, and the most it reaches today. Open-Meteo has both;
-  # wttr.in fills in for either.
-  | ((if $f and $f.current then $f.current.uv_index | num else null end)
+  # wttr.in fills in for either, and for a reading over an hour old.
+  | ($local != null and ($f.current.time | type) == "string"
+     and (($f.current.time | om_seconds) as $t | $t != null and $local - $t < 3600)) as $om_current
+  | ((if $om_current then $f.current.uv_index | num else null end)
      // ($c.uvIndex | num)) as $uv_now
   | ((if $d == null then null else $f.daily.uv_index_max[$d] | num end)
      // ($today_report.uvIndex | num)) as $uv_max
@@ -170,7 +190,7 @@ jq -c "${OM[@]}" --argjson hours "$HOURS" --argjson days "$DAYS" \
         $a.areaName[0].value + ", " + $a.country[0].value + "\n"
         + $c.weatherDesc[0].value + " " + $c.temp_C + "°C"
         + " (feels " + $c.FeelsLikeC + "°C)\n"
-        + "High " + $today_report.maxtempC + "° / Low " + $today_report.mintempC + "°\n"
+        + (if $today_report then "High " + $today_report.maxtempC + "° / Low " + $today_report.mintempC + "°\n" else "" end)
         + "Wind " + $c.windspeedKmph + " km/h " + $c.winddir16Point + "\n"
         + "Humidity " + $c.humidity + "%"
         + (if $uv_now != null and $uv_max != null
@@ -185,7 +205,7 @@ jq -c "${OM[@]}" --argjson hours "$HOURS" --argjson days "$DAYS" \
         cond: ($code | wwo_cond),
         night: $night,
         uv: (if $uv_now != null and $uv_max != null
-             then { now: ($uv_now | tenths), max: ([$uv_now, $uv_max] | max | tenths) }
+             then { now: ($uv_now | round), max: ([$uv_now, $uv_max] | max | round) }
              else null end),
         wind: (if $wind then { min: ($wind.min | round), max: ($wind.max | round) } else null end),
         hourly: ($om_hourly // $wttr_hourly),
